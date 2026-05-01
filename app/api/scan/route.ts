@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { ScanInputSchema, ScanOutputSchema, parseOrThrow, SchemaError } from "@/lib/schemas";
 
 const SCAN_PROMPT = `You are a privacy scanner. Analyze the message for sensitive data and return ONLY JSON:
 
@@ -17,14 +18,22 @@ Be liberal in detection — flag anything that could be sensitive in any context
 Return ONLY valid JSON. No markdown, no explanation.`;
 
 export async function POST(req: NextRequest) {
-  const { message } = await req.json();
-
-  if (!message?.trim() || message.trim().length < 10) {
-    return NextResponse.json({ sensitive_detected: [] });
+  let input;
+  try {
+    input = parseOrThrow(ScanInputSchema, await req.json(), "scan input");
+  } catch (err) {
+    if (err instanceof SchemaError) {
+      return NextResponse.json({ error: err.message, issues: err.issues }, { status: 400 });
+    }
+    return NextResponse.json({ error: "Malformed JSON body" }, { status: 400 });
   }
 
-  if (!process.env.OPENROUTER_API_KEY) {
-    return NextResponse.json({ error: "OPENROUTER_API_KEY not configured" }, { status: 500 });
+  if (!input.message?.trim() || input.message.trim().length < 10) {
+    return NextResponse.json(ScanOutputSchema.parse({ sensitive_detected: [] }));
+  }
+
+  if (!process.env.OPENROUTER_API_KEY && !process.env.ANTHROPIC_API_KEY) {
+    return NextResponse.json({ error: "OPENROUTER_API_KEY or ANTHROPIC_API_KEY not configured" }, { status: 500 });
   }
 
   try {
@@ -40,7 +49,7 @@ export async function POST(req: NextRequest) {
         model: "anthropic/claude-haiku-4-5",
         messages: [
           { role: "system", content: SCAN_PROMPT },
-          { role: "user", content: message },
+          { role: "user", content: input.message },
         ],
         temperature: 0.1,
         max_tokens: 512,
@@ -48,20 +57,29 @@ export async function POST(req: NextRequest) {
     });
 
     if (!response.ok) {
-      return NextResponse.json({ sensitive_detected: [] });
+      return NextResponse.json(ScanOutputSchema.parse({ sensitive_detected: [] }));
     }
 
     const data = await response.json();
     const raw = data.choices?.[0]?.message?.content?.trim() ?? "";
     const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
 
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(cleaned);
-      return NextResponse.json({ sensitive_detected: parsed.sensitive_detected ?? [] });
+      parsed = JSON.parse(cleaned);
     } catch {
-      return NextResponse.json({ sensitive_detected: [] });
+      return NextResponse.json(ScanOutputSchema.parse({ sensitive_detected: [] }));
     }
+
+    const validated = ScanOutputSchema.safeParse({
+      sensitive_detected:
+        (parsed as { sensitive_detected?: unknown }).sensitive_detected ?? [],
+    });
+    if (!validated.success) {
+      return NextResponse.json(ScanOutputSchema.parse({ sensitive_detected: [] }));
+    }
+    return NextResponse.json(validated.data);
   } catch {
-    return NextResponse.json({ sensitive_detected: [] });
+    return NextResponse.json(ScanOutputSchema.parse({ sensitive_detected: [] }));
   }
 }

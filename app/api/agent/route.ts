@@ -5,8 +5,22 @@ import {
 } from "@/lib/types";
 import {
   THIRD_PARTY_REGISTRY, SERVICE_ALTERNATIVES,
-  isServiceBlocked, getServiceRisk,
+  getServiceRisk,
 } from "@/lib/thirdPartyRegistry";
+import {
+  AgentInputSchema,
+  AgentOutputSchema,
+  parseOrThrow,
+  RawAgentStepSchema,
+  SchemaError,
+} from "@/lib/schemas";
+import {
+  getPolicy,
+  policyAsPromptData,
+  sensitiveCategoriesFor,
+  shouldBlockService,
+} from "@/lib/policy/personas";
+import { z } from "zod";
 
 const SERVICE_KEYS = Object.keys(THIRD_PARTY_REGISTRY).join(", ");
 const PERSONA_RANK: Record<Persona, number> = {
@@ -47,7 +61,7 @@ function detectAutoPersona(goal: string, current: Persona): { persona: Persona; 
   return { persona: current };
 }
 
-function buildAgentPrompt(persona: string): string {
+function buildAgentPrompt(persona: Persona): string {
   return `You are a task decomposition agent for an autonomous AI system. Given a user's high-level goal, break it into 4-6 concrete sub-actions the agent would take to complete it. Be realistic and specific about what data each step accesses.
 
 Available third-party services (use ONLY these keys exactly): ${SERVICE_KEYS}
@@ -78,16 +92,19 @@ Rules:
 - exposed_data should be specific (e.g. "Full name, home address at 42 Main St, payment card ending 4411")
 - inferred_risk should flag indirect exposure (searching symptoms implies likely condition)
 - Make the scenario realistic for a university student
-- Current persona context: ${persona}`;
+
+Active persona policy (data, not prose — observe these for downstream governance):
+${policyAsPromptData(persona)}`;
 }
 
 function computeVerdict(
   step: RawAgentStep,
   persona: Persona,
 ): { verdict: AgentVerdict; nora_action: string; alternative_service?: string; minimized_data?: string } {
+  const policy = getPolicy(persona);
   const serviceKey = step.third_party || "none";
   const service = getServiceRisk(serviceKey);
-  const serviceBlocked = isServiceBlocked(serviceKey, persona);
+  const serviceBlocked = shouldBlockService(persona, service.riskLevel);
   const altKey = SERVICE_ALTERNATIVES[serviceKey];
 
   if (serviceBlocked) {
@@ -96,22 +113,14 @@ function computeVerdict(
       verdict: altService ? "negotiated" : "blocked",
       nora_action: altService
         ? `Blocked ${service.name} (${service.riskLevel.toUpperCase()} risk: ${service.notes ?? "data sharing risk exceeds persona"}). Rerouted to ${altService.name} - same task, lower exposure.`
-        : `Blocked ${service.name} - ${service.riskLevel.toUpperCase()} risk exceeds ${persona} persona threshold. ${service.notes ?? ""} Task cannot complete via this channel.`,
+        : `Blocked ${service.name} - ${service.riskLevel.toUpperCase()} risk exceeds ${policy.label} persona threshold. ${service.notes ?? ""} Task cannot complete via this channel.`,
       alternative_service: altKey,
     };
   }
 
+  const sensitiveCats = new Set(sensitiveCategoriesFor(persona));
   const hasSensitiveData = step.data_categories.length > 0;
-  const sensitiveForPersona =
-    persona === "conservative"
-      ? step.data_categories
-      : persona === "balanced"
-        ? step.data_categories.filter((c) =>
-            ["address", "health", "financial", "emotional"].includes(c)
-          )
-        : step.data_categories.filter((c) =>
-            ["health", "financial"].includes(c)
-          );
+  const sensitiveForPersona = step.data_categories.filter((c) => sensitiveCats.has(c));
 
   if (hasSensitiveData && sensitiveForPersona.length > 0) {
     const removed = sensitiveForPersona.join(", ");
@@ -122,7 +131,11 @@ function computeVerdict(
     };
   }
 
-  if (step.inferred_risk && step.inferred_risk.trim().length > 0 && persona !== "open") {
+  if (
+    step.inferred_risk &&
+    step.inferred_risk.trim().length > 0 &&
+    policy.inferenceProtection
+  ) {
     return {
       verdict: "intercepted",
       nora_action: `Inference risk detected: ${step.inferred_risk}. Request generalized to prevent revealing sensitive status indirectly.`,
@@ -197,11 +210,11 @@ function buildCampusHealthDemoTrace(goal: string, persona: Persona, autoReason?:
     auto_persona: persona,
     auto_persona_reason: autoReason,
     steps,
-    summary: buildSummary(steps, persona),
+    summary: buildSummary(steps),
   };
 }
 
-function buildSummary(steps: AgentStep[], persona: Persona): AgentTraceSummary {
+function buildSummary(steps: AgentStep[]): AgentTraceSummary {
   const clean = steps.filter((s) => s.verdict === "clean").length;
   const intercepted = steps.filter((s) => s.verdict === "intercepted").length;
   const blocked = steps.filter((s) => s.verdict === "blocked").length;
@@ -242,25 +255,32 @@ function buildSummary(steps: AgentStep[], persona: Persona): AgentTraceSummary {
   };
 }
 
-export async function POST(req: NextRequest) {
-  const { goal, persona = "balanced" } = await req.json();
+const AgentPlanResponseSchema = z.object({
+  goal_summary: z.string(),
+  steps: z.array(RawAgentStepSchema),
+});
 
-  if (!goal?.trim()) {
-    return NextResponse.json({ error: "Goal is required" }, { status: 400 });
+export async function POST(req: NextRequest) {
+  let input;
+  try {
+    input = parseOrThrow(AgentInputSchema, await req.json(), "agent input");
+  } catch (err) {
+    if (err instanceof SchemaError) {
+      return NextResponse.json({ error: err.message, issues: err.issues }, { status: 400 });
+    }
+    return NextResponse.json({ error: "Malformed JSON body" }, { status: 400 });
   }
 
-  const requestedPersona = (["conservative", "balanced", "open"].includes(persona)
-    ? persona
-    : "balanced") as Persona;
-  const escalation = detectAutoPersona(goal, requestedPersona);
+  const escalation = detectAutoPersona(input.goal, input.persona);
   const effectivePersona = escalation.persona;
   const isCampusHealthDemo =
-    /health center|campus health|clinic|book a ride|schedule a visit/i.test(goal);
+    /health center|campus health|clinic|book a ride|schedule a visit/i.test(input.goal);
 
-  if (!process.env.OPENROUTER_API_KEY || isCampusHealthDemo) {
-    return NextResponse.json(
-      buildCampusHealthDemoTrace(goal, effectivePersona, escalation.reason)
-    );
+  const apiKeyAvailable = !!(process.env.OPENROUTER_API_KEY || process.env.ANTHROPIC_API_KEY);
+
+  if (!apiKeyAvailable || isCampusHealthDemo) {
+    const trace = buildCampusHealthDemoTrace(input.goal, effectivePersona, escalation.reason);
+    return NextResponse.json(AgentOutputSchema.parse(trace));
   }
 
   try {
@@ -276,7 +296,7 @@ export async function POST(req: NextRequest) {
         model: "anthropic/claude-sonnet-4-5",
         messages: [
           { role: "system", content: buildAgentPrompt(effectivePersona) },
-          { role: "user", content: goal },
+          { role: "user", content: input.goal },
         ],
         temperature: 0.4,
       }),
@@ -291,30 +311,45 @@ export async function POST(req: NextRequest) {
     const raw = data.choices?.[0]?.message?.content?.trim() ?? "";
     const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
 
-    let parsed: { goal_summary: string; steps: RawAgentStep[] };
+    let parsedJson: unknown;
     try {
-      parsed = JSON.parse(cleaned);
+      parsedJson = JSON.parse(cleaned);
     } catch {
-      return NextResponse.json({ error: "Failed to parse agent plan" }, { status: 500 });
+      return NextResponse.json({ error: "Failed to parse agent plan" }, { status: 502 });
     }
 
-    const governedSteps: AgentStep[] = parsed.steps.map((step) => {
+    const planValidation = AgentPlanResponseSchema.safeParse(parsedJson);
+    if (!planValidation.success) {
+      return NextResponse.json(
+        { error: "Agent plan did not match expected schema", issues: planValidation.error.issues },
+        { status: 502 }
+      );
+    }
+
+    const governedSteps: AgentStep[] = planValidation.data.steps.map((step) => {
       const overlay = computeVerdict(step, effectivePersona);
       return { ...step, ...overlay };
     });
 
     const trace: AgentTrace = {
-      goal_summary: parsed.goal_summary,
+      goal_summary: planValidation.data.goal_summary,
       auto_persona: effectivePersona,
       auto_persona_reason: escalation.reason,
       steps: governedSteps,
-      summary: buildSummary(governedSteps, effectivePersona),
+      summary: buildSummary(governedSteps),
     };
 
-    return NextResponse.json(trace);
-  } catch (err) {
-    return NextResponse.json(
-      buildCampusHealthDemoTrace(goal, effectivePersona, escalation.reason)
-    );
+    const traceValidation = AgentOutputSchema.safeParse(trace);
+    if (!traceValidation.success) {
+      console.error("Agent trace schema mismatch:", traceValidation.error.issues);
+      return NextResponse.json(
+        { error: "Agent trace schema mismatch", issues: traceValidation.error.issues },
+        { status: 502 }
+      );
+    }
+    return NextResponse.json(traceValidation.data);
+  } catch {
+    const trace = buildCampusHealthDemoTrace(input.goal, effectivePersona, escalation.reason);
+    return NextResponse.json(AgentOutputSchema.parse(trace));
   }
 }

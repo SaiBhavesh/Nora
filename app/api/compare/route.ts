@@ -1,7 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  CompareInputSchema,
+  CompareOutputSchema,
+  parseOrThrow,
+  SchemaError,
+} from "@/lib/schemas";
+import type { Persona } from "@/lib/types";
+import { getPolicy, policyAsPromptData } from "@/lib/policy/personas";
 
-function buildPrompt(persona: string): string {
-  return `You are Nora, a privacy governance layer. Analyze the message for the "${persona}" persona and return ONLY valid JSON:
+function buildPrompt(persona: Persona): string {
+  const policy = getPolicy(persona);
+  return `You are Nora, a privacy governance layer. Analyze the message for the "${policy.label}" persona and return ONLY valid JSON:
 
 {
   "sensitive_detected": [
@@ -12,15 +21,13 @@ function buildPrompt(persona: string): string {
   "persona_impact": "one sentence summary of what this persona blocked"
 }
 
-Persona rules:
-- conservative: block everything — locations, health, emotional, financial, behavioral, academic
-- balanced: block clearly sensitive — exact addresses, explicit health conditions, financial data
-- open: block only dangerous — exact home address, explicit medical, raw financial details
+Active persona policy (data, not prose — apply these weights and thresholds):
+${policyAsPromptData(persona)}
 
 Return ONLY valid JSON. No markdown, no backticks.`;
 }
 
-async function runPersona(message: string, persona: string): Promise<unknown> {
+async function runPersona(message: string, persona: Persona): Promise<unknown> {
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -48,24 +55,36 @@ async function runPersona(message: string, persona: string): Promise<unknown> {
 }
 
 export async function POST(req: NextRequest) {
-  const { message } = await req.json();
-
-  if (!message?.trim()) {
-    return NextResponse.json({ error: "Message is required" }, { status: 400 });
+  let input;
+  try {
+    input = parseOrThrow(CompareInputSchema, await req.json(), "compare input");
+  } catch (err) {
+    if (err instanceof SchemaError) {
+      return NextResponse.json({ error: err.message, issues: err.issues }, { status: 400 });
+    }
+    return NextResponse.json({ error: "Malformed JSON body" }, { status: 400 });
   }
 
-  if (!process.env.OPENROUTER_API_KEY) {
-    return NextResponse.json({ error: "OPENROUTER_API_KEY not configured" }, { status: 500 });
+  if (!process.env.OPENROUTER_API_KEY && !process.env.ANTHROPIC_API_KEY) {
+    return NextResponse.json({ error: "OPENROUTER_API_KEY or ANTHROPIC_API_KEY not configured" }, { status: 500 });
   }
 
   try {
     const [conservative, balanced, open] = await Promise.all([
-      runPersona(message, "conservative"),
-      runPersona(message, "balanced"),
-      runPersona(message, "open"),
+      runPersona(input.message, "conservative"),
+      runPersona(input.message, "balanced"),
+      runPersona(input.message, "open"),
     ]);
 
-    return NextResponse.json({ conservative, balanced, open });
+    const validated = CompareOutputSchema.safeParse({ conservative, balanced, open });
+    if (!validated.success) {
+      console.error("Compare output schema mismatch:", validated.error.issues);
+      return NextResponse.json(
+        { error: "AI response did not match expected schema", issues: validated.error.issues },
+        { status: 502 }
+      );
+    }
+    return NextResponse.json(validated.data);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Internal server error";
     return NextResponse.json({ error: msg }, { status: 500 });

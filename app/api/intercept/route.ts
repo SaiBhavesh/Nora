@@ -1,7 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  InterceptInputSchema,
+  InterceptOutputSchema,
+  parseOrThrow,
+  SchemaError,
+} from "@/lib/schemas";
+import { getPolicy, policyAsPromptData } from "@/lib/policy/personas";
 
 function buildSystemPrompt(persona: string, blockedCategories: string[]): string {
-  const categoryContext = blockedCategories?.length
+  const policy = getPolicy(persona as "conservative" | "balanced" | "open");
+  const categoryContext = blockedCategories.length
     ? `The user has specifically configured these categories to be blocked: ${blockedCategories.join(", ")}.`
     : "";
 
@@ -23,15 +31,12 @@ Analyze the user's message and return ONLY a JSON object with these exact fields
   "without_sentinel_response": "a realistic 2-3 sentence response from a standard AI that explicitly references the sensitive data",
   "with_sentinel_response": "a realistic 2-3 sentence response from a privacy-safe AI using only the rewritten message",
   "protection_score": 75,
-  "persona_impact": "Your ${persona} persona blocked X of Y sensitive signals"
+  "persona_impact": "Your ${policy.label} persona blocked X of Y sensitive signals"
 }
 
-Persona rules:
-- conservative: block everything — exact locations, all health signals, emotional states, financial hints, behavioral patterns
-- balanced: block clearly sensitive data — exact addresses, explicit health conditions, but allow general area and mild context
-- open: block only dangerous disclosures — explicit medical conditions, exact home address, raw financial details
+Active persona policy (data, not prose — apply these weights and thresholds):
+${policyAsPromptData(persona as "conservative" | "balanced" | "open")}
 
-Current persona: ${persona}
 ${categoryContext}
 
 Important rules:
@@ -73,23 +78,27 @@ async function callAI(system: string, message: string): Promise<string> {
 }
 
 export async function POST(req: NextRequest) {
-  const { message, persona, blockedCategories } = await req.json();
-
-  if (!message?.trim()) {
-    return NextResponse.json({ error: "Message is required" }, { status: 400 });
+  let input;
+  try {
+    input = parseOrThrow(InterceptInputSchema, await req.json(), "intercept input");
+  } catch (err) {
+    if (err instanceof SchemaError) {
+      return NextResponse.json({ error: err.message, issues: err.issues }, { status: 400 });
+    }
+    return NextResponse.json({ error: "Malformed JSON body" }, { status: 400 });
   }
 
-  if (!process.env.OPENROUTER_API_KEY) {
+  if (!process.env.OPENROUTER_API_KEY && !process.env.ANTHROPIC_API_KEY) {
     return NextResponse.json(
-      { error: "OPENROUTER_API_KEY not configured in .env.local" },
+      { error: "OPENROUTER_API_KEY or ANTHROPIC_API_KEY not configured in .env.local" },
       { status: 500 }
     );
   }
 
   try {
     const raw = await callAI(
-      buildSystemPrompt(persona ?? "balanced", blockedCategories ?? []),
-      message
+      buildSystemPrompt(input.persona, input.blockedCategories),
+      input.message
     );
 
     if (!raw) {
@@ -98,13 +107,23 @@ export async function POST(req: NextRequest) {
 
     const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
 
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(cleaned);
-      return NextResponse.json(parsed);
+      parsed = JSON.parse(cleaned);
     } catch {
       console.error("JSON parse failed:", cleaned);
-      return NextResponse.json({ error: "Failed to parse AI response" }, { status: 500 });
+      return NextResponse.json({ error: "Failed to parse AI response" }, { status: 502 });
     }
+
+    const validated = InterceptOutputSchema.safeParse(parsed);
+    if (!validated.success) {
+      console.error("Intercept output schema mismatch:", validated.error.issues);
+      return NextResponse.json(
+        { error: "AI response did not match expected schema", issues: validated.error.issues },
+        { status: 502 }
+      );
+    }
+    return NextResponse.json(validated.data);
   } catch (err: unknown) {
     console.error("Intercept error:", err);
     const msg = err instanceof Error ? err.message : "Internal server error";
