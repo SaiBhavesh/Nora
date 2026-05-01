@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+node_modules - Copy/
+
+# Environment variables
+.env.local
+.env*.local
+
+# Next.js build output
+.next/
+.next - Copy/
+out/
+
+# Build artifacts
+*.tsbuildinfo
+tsconfig - Copy.tsbuildinfo
+
+# Backup/copy folders
+app - Copy/
+components - Copy/
+lib - Copy/
+.claude - Copy/
+
+# OS
+.DS_Store
+Thumbs.db
